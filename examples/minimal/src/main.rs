@@ -33,7 +33,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
     let mut node = Node::new(args.seed)?;
-    node.set_verbose(args.verbose);
+    node.verbose = args.verbose;
 
     if let Some(port) = args.listen_port {
         let listen_addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{port}").parse()?;
@@ -112,7 +112,7 @@ impl NodeBehaviour {
 
 pub struct Node {
     pub swarm: Swarm<NodeBehaviour>,
-    verbose: bool,
+    pub verbose: bool,
 }
 
 impl Node {
@@ -128,15 +128,10 @@ impl Node {
         println!("local peer id: {peer_id}");
         let behaviour = NodeBehaviour::new(&keypair)?;
         let swarm = SwarmBuilder::with_executor(transport, behaviour, peer_id, Tokio).build();
-        let node = Self {
+        Ok(Self {
             swarm,
             verbose: false,
-        };
-        Ok(node)
-    }
-
-    pub fn set_verbose(&mut self, verbose: bool) {
-        self.verbose = verbose;
+        });
     }
 
     pub async fn drive_until_bistream(&mut self) -> bistream::BiStream {

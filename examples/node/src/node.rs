@@ -459,15 +459,7 @@ impl Node {
 
             // Use relay nodes.
             SwarmEvent::Behaviour(Identify(identify::Event::Received { peer_id, info })) => {
-                // eprintln!("IDENTIFY {peer_id} {info:?}");
-                // eprintln!(
-                //     "allowed contains {} active contains {}",
-                //     self.allowed_relays.contains(&peer_id),
-                //     self.active_relays.contains_key(&peer_id)
-                // );
-                // check if the node supports dcutr
-                // if so use as relay
-                // TODO: Only if we are not public ourselves
+                // TODO: Only if we are not publicly reachable ourselves
                 if self.allowed_relays.contains(&peer_id) && !self.active_relays.contains_key(&peer_id)
                     // TODO: Make sure to decrease again
                     && self.active_relays.len() < MAX_RELAYS
