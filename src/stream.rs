@@ -46,9 +46,9 @@ impl fmt::Display for BiStream {
         let peer_id = self.peer_id.to_base58();
         write!(
             f,
-            "{}..{}:{}{}",
-            &peer_id[..4],
-            &peer_id[peer_id.len() - 2..],
+            "{}…{}:{}{}",
+            &peer_id[..2],
+            &peer_id[peer_id.len() - 3..],
             d,
             self.stream_id
         )

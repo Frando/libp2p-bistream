@@ -1,16 +1,16 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    path::Path,
     time::Duration,
 };
 
 use anyhow::anyhow;
-use futures::{stream::BoxStream, Future, FutureExt, StreamExt};
+use futures::{Future, FutureExt, StreamExt};
 use libp2p::{
     core::{
         self,
         muxing::StreamMuxerBox,
         transport::{Boxed, OrTransport},
+        ConnectedPoint,
     },
     dcutr, dns, identify,
     identity::{ed25519, Keypair},
@@ -19,17 +19,16 @@ use libp2p::{
     swarm::{ConnectionHandler, Executor, IntoConnectionHandler, NetworkBehaviour},
     tcp, yamux, Multiaddr, PeerId, Swarm, Transport,
 };
-use serde::{Deserialize, Serialize};
 use tokio::sync::{
     mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender},
     oneshot,
 };
 use tracing::{error, info, warn};
 
-use crate::behaviour::{bistream, NodeBehaviour};
-use crate::util::{GlobalIp, MatchProtocol};
+use libp2p_bistream as bistream;
 
-pub type PeerChannel = BoxStream<'static, Vec<u8>>;
+use crate::behaviour::NodeBehaviour;
+use crate::util::{GlobalIp, MatchProtocol};
 
 pub const MAX_RELAYS: usize = 2;
 
@@ -47,9 +46,28 @@ pub const DEFAULT_BOOTSTRAP: &[&str] = &[
     // mars.i.ipfs.io
 ];
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct Config {
     seed: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct ListenConfig {
+    listen_addr: Multiaddr,
+    relays: Option<Vec<Multiaddr>>,
+}
+
+impl ListenConfig {
+    pub fn new() -> Self {
+        Self {
+            listen_addr: "/ip4/0.0.0.0/tcp/4001".parse().unwrap(),
+            relays: None,
+        }
+    }
+
+    pub fn with_relays(self, relays: Option<Vec<Multiaddr>>) -> Self {
+        Self { relays, ..self }
+    }
 }
 
 impl Config {
@@ -70,14 +88,6 @@ impl NodeEvents {
     pub async fn next(&mut self) -> Option<Event> {
         self.event_rx.recv().await
     }
-    pub async fn next_until<T>(&mut self, matcher: impl Fn(Event) -> Option<T>) -> Option<T> {
-        while let Some(event) = self.next().await {
-            if let Some(t) = matcher(event) {
-                return Some(t);
-            }
-        }
-        None
-    }
 }
 
 #[derive(Clone)]
@@ -85,17 +95,12 @@ pub struct NodeController {
     command_tx: UnboundedSender<Command>,
 }
 impl NodeController {
-    pub fn dial_ticket(&mut self, ticket: impl Into<Ticket>) {
-        let ticket = ticket.into();
-        let _ = self.command_tx.send(Command::Dial(ticket.addrs));
-    }
-
-    pub fn dial_addrs(&mut self, addrs: Vec<Multiaddr>) {
+    pub fn dial(&mut self, addrs: Vec<Multiaddr>) {
         let _ = self.command_tx.send(Command::Dial(addrs));
     }
 
-    pub fn listen(&mut self, relays: Option<Vec<Multiaddr>>) {
-        let _ = self.command_tx.send(Command::Listen { relays });
+    pub fn listen(&mut self, config: ListenConfig) {
+        let _ = self.command_tx.send(Command::Listen { config });
     }
 
     pub fn open_bi(
@@ -104,7 +109,7 @@ impl NodeController {
     ) -> impl Future<Output = anyhow::Result<bistream::BiStream>> {
         let (tx, rx) = oneshot::channel();
         let _ = self.command_tx.send(Command::OpenBi(peer_id, tx));
-        rx.map(|r| r.map_or_else(|e| Err(anyhow::anyhow!(e)), |r| r))
+        rx.map(|r| r.map_or_else(|e| Err(anyhow::anyhow!(e)), |r| r.map_err(|err| err.into())))
     }
 }
 
@@ -114,24 +119,28 @@ pub struct Node {
     command_rx: UnboundedReceiver<Command>,
     command_tx: UnboundedSender<Command>,
     listen_addrs: HashSet<Multiaddr>,
-    relay_addrs: HashSet<Multiaddr>,
+    allowed_relays: HashSet<PeerId>,
     active_relays: HashMap<PeerId, HashSet<ListenerId>>,
     pending_peers: HashMap<PeerId, VecDeque<Command>>,
 }
 
-pub type BiStreamReply = oneshot::Sender<anyhow::Result<bistream::BiStream>>;
+pub type BiStreamReply = oneshot::Sender<Result<bistream::BiStream, bistream::OpenError>>;
 
 #[derive(Debug)]
 pub enum Command {
     Dial(Vec<Multiaddr>),
-    Listen { relays: Option<Vec<Multiaddr>> },
+    Listen { config: ListenConfig },
     OpenBi(PeerId, BiStreamReply),
 }
 
 #[derive(Debug)]
 pub enum Event {
-    TicketReady(Ticket),
-    BiStream(bistream::Event),
+    NewListenAddr(Multiaddr),
+    IncomingBiStream(bistream::BiStream),
+    ConnectionEstablished {
+        peer_id: PeerId,
+        endpoint: ConnectedPoint,
+    },
     NodeError(anyhow::Error),
 }
 
@@ -156,7 +165,7 @@ impl Node {
 
         let (transport, relay_client) = build_transport(&keypair);
         let peer_id = keypair.public().to_peer_id();
-        let limits = ConnectionLimits::default();
+        let limits = ConnectionLimits::default().with_max_established_per_peer(Some(1));
         let behaviour = NodeBehaviour::new(&keypair, relay_client)?;
         let swarm = SwarmBuilder::with_executor(transport, behaviour, peer_id, Tokio)
             .connection_limits(limits)
@@ -171,7 +180,7 @@ impl Node {
             command_rx,
             command_tx: command_tx.clone(),
             listen_addrs: HashSet::new(),
-            relay_addrs: HashSet::new(),
+            allowed_relays: HashSet::new(),
             active_relays: HashMap::new(),
             pending_peers: HashMap::new(),
         };
@@ -207,13 +216,8 @@ impl Node {
 
     async fn new_listen_addr(&mut self, addr: Multiaddr) -> anyhow::Result<()> {
         if !self.listen_addrs.contains(&addr) {
-            self.listen_addrs.insert(addr);
-            let ticket = Ticket::new(
-                self.swarm.local_peer_id().clone(),
-                self.listen_addrs.iter().cloned().collect(),
-            );
-            ticket.write_to_file(Path::new("/tmp/ticket"))?;
-            self.emit_event(Event::TicketReady(ticket)).await;
+            self.listen_addrs.insert(addr.clone());
+            self.emit_event(Event::NewListenAddr(addr)).await;
         }
         Ok(())
     }
@@ -230,6 +234,7 @@ impl Node {
                     }
                 },
                 command = self.command_rx.recv() => {
+                    eprintln!("handle command {command:?}");
                     match command {
                         None => break,
                         Some(command) => {
@@ -247,15 +252,20 @@ impl Node {
 
     async fn handle_command(&mut self, command: Command) -> anyhow::Result<()> {
         match command {
-            Command::Listen { relays } => {
+            Command::Listen { config } => {
                 eprintln!("Local Peer ID: {}", self.swarm.local_peer_id());
-                let listen_addr: Multiaddr = "/ip4/0.0.0.0/tcp/4001".parse()?;
-                self.swarm.listen_on(listen_addr)?;
+                self.swarm.listen_on(config.listen_addr)?;
 
-                if let Some(relays) = relays {
+                if let Some(relays) = config.relays {
                     for addr in relays {
-                        self.swarm.dial(addr.clone())?;
-                        self.relay_addrs.insert(addr);
+                        if let Some(peer_id) = PeerId::try_from_multiaddr(&addr) {
+                            eprintln!("dial relay for {peer_id} on {addr}");
+                            self.swarm.dial(addr.clone())?;
+                            self.allowed_relays.insert(peer_id);
+                        } else {
+                            eprintln!("skip relay {addr}: no peer id");
+                            warn!("Peer ID is required for relay addresses");
+                        }
                     }
                 }
                 // Bootstrap DHT if enabled.
@@ -275,30 +285,32 @@ impl Node {
 
             Command::Dial(addrs) => {
                 for addr in addrs {
-                    self.swarm.dial(addr)?;
+                    let _ = self.swarm.dial(addr);
                 }
             }
 
             Command::OpenBi(peer_id, reply) => {
-                if self.swarm.is_connected(&peer_id) {
-                    self.swarm.behaviour_mut().bistream.open_bi(&peer_id, reply)
-                } else {
-                    let addrs = self.swarm.behaviour_mut().addresses_of_peer(&peer_id);
-                    if !addrs.is_empty() {
-                        for addr in addrs {
-                            self.swarm.dial(addr)?;
-                        }
-                    } else {
-                        if let Some(kad) = self.swarm.behaviour_mut().kademlia.as_mut() {
-                            kad.get_closest_peers(peer_id);
-                        }
-                    }
-                    let command = Command::OpenBi(peer_id, reply);
-                    self.pending_peers
-                        .entry(peer_id)
-                        .or_default()
-                        .push_back(command);
-                }
+                eprintln!("node oncommand open_bi {peer_id}");
+                self.swarm.behaviour_mut().bistream.open_bi(&peer_id, reply)
+                // if self.swarm.is_connected(&peer_id) {
+                //     self.swarm.behaviour_mut().bistream.open_bi(&peer_id, reply)
+                // } else {
+                //     let addrs = self.swarm.behaviour_mut().addresses_of_peer(&peer_id);
+                //     if !addrs.is_empty() {
+                //         for addr in addrs {
+                //             let _ = self.swarm.dial(addr);
+                //         }
+                //     } else {
+                //         if let Some(kad) = self.swarm.behaviour_mut().kademlia.as_mut() {
+                //             kad.get_closest_peers(peer_id);
+                //         }
+                //     }
+                //     let command = Command::OpenBi(peer_id, reply);
+                //     self.pending_peers
+                //         .entry(peer_id)
+                //         .or_default()
+                //         .push_back(command);
+                // }
             }
         }
         Ok(())
@@ -312,12 +324,33 @@ impl Node {
                 self.new_listen_addr(address).await?;
             }
 
-            SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+            SwarmEvent::ConnectionEstablished {
+                peer_id, endpoint, ..
+            } => {
                 if let Some(mut pending) = self.pending_peers.remove(&peer_id) {
                     while let Some(command) = pending.pop_front() {
                         self.command_tx.send(command)?;
                     }
                 }
+                let _ = self
+                    .event_tx
+                    .send(Event::ConnectionEstablished { peer_id, endpoint })
+                    .await;
+            }
+
+            SwarmEvent::ConnectionClosed {
+                peer_id,
+                endpoint,
+                cause,
+                ..
+            } => {
+                eprintln!(
+                    "Connection closed to {peer_id} on {} (dialer: {}, relays: {}) cause {:?}",
+                    endpoint.get_remote_address(),
+                    if endpoint.is_dialer() { "us" } else { "them" },
+                    endpoint.is_relayed(),
+                    cause
+                )
             }
 
             // Dial pending peers if discovered via MDNS.
@@ -347,25 +380,30 @@ impl Node {
             }
 
             // Emit new incoming streams.
-            SwarmEvent::Behaviour(Bistream(ev)) => self
+            SwarmEvent::Behaviour(Bistream(bistream::Event::IncomingStream(stream))) => self
                 .event_tx
-                .send(Event::BiStream(ev))
+                .send(Event::IncomingBiStream(stream))
                 .await
                 .map_err(|_| anyhow!("Event receiver dropped"))?,
 
             // Use relay nodes.
             SwarmEvent::Behaviour(Identify(identify::Event::Received { peer_id, info })) => {
+                // eprintln!("IDENTIFY {peer_id} {info:?}");
+                // eprintln!(
+                //     "allowed contains {} active contains {}",
+                //     self.allowed_relays.contains(&peer_id),
+                //     self.active_relays.contains_key(&peer_id)
+                // );
                 // check if the node supports dcutr
                 // if so use as relay
                 // TODO: Only if we are not public ourselves
-                if !self.active_relays.contains_key(&peer_id)
+                if self.allowed_relays.contains(&peer_id) && !self.active_relays.contains_key(&peer_id)
                     // TODO: Make sure to decrease again
                     && self.active_relays.len() < MAX_RELAYS
                     && info
                         .protocols
                         .iter()
                         .any(|x| x.as_bytes() == dcutr::PROTOCOL_NAME)
-                    && !self.relay_addrs.intersection(&info.listen_addrs.iter().cloned().collect()).next().is_some()
                 {
                     self.listen_relay(peer_id, &info.listen_addrs)?;
                 }
@@ -388,11 +426,14 @@ impl Node {
                 addr.with(multiaddr::Protocol::P2p(peer_id.into()))
                     .with(multiaddr::Protocol::P2pCircuit)
             })
-            .filter_map(|addr| match self.swarm.listen_on(addr.clone()) {
-                Ok(id) => Some(id),
-                Err(err) => {
-                    error!("Failed to listen via DCUTR on {}: {:?}", addr, err);
-                    None
+            .filter_map(|addr| {
+                info!("Listen on relay {addr}");
+                match self.swarm.listen_on(addr.clone()) {
+                    Ok(id) => Some(id),
+                    Err(err) => {
+                        error!("Failed to listen via DCUTR on {}: {:?}", addr, err);
+                        None
+                    }
                 }
             });
         let listener_ids: HashSet<_> = listener_ids.collect();
@@ -407,52 +448,6 @@ struct Tokio;
 impl Executor for Tokio {
     fn exec(&self, fut: std::pin::Pin<Box<dyn futures::Future<Output = ()> + Send>>) {
         tokio::task::spawn(fut);
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Ticket {
-    peer_id: PeerId,
-    addrs: Vec<Multiaddr>,
-}
-
-impl Ticket {
-    pub fn new(peer_id: PeerId, addrs: Vec<Multiaddr>) -> Self {
-        Self { peer_id, addrs }
-    }
-
-    pub fn from_addr(peer_id: PeerId, addr: Multiaddr) -> Self {
-        Self {
-            peer_id,
-            addrs: vec![addr],
-        }
-    }
-
-    pub fn from_addrs(peer_id: PeerId, addrs: Vec<Multiaddr>) -> Self {
-        Self { peer_id, addrs }
-    }
-
-    pub fn from_string(input: &str) -> anyhow::Result<Self> {
-        let (_base, compressed) = multibase::decode(&input)?;
-        let encoded = lz4_flex::decompress_size_prepended(&compressed)?;
-        let ticket = bincode::deserialize(&encoded)?;
-        Ok(ticket)
-    }
-
-    pub fn serialize(&self) -> anyhow::Result<String> {
-        let encoded = bincode::serialize(&self)?;
-        let compressed = lz4_flex::compress_prepend_size(&encoded);
-        let b32 = multibase::encode(multibase::Base::Base64Url, compressed);
-        Ok(b32)
-    }
-
-    pub fn write_to_file(&self, path: &Path) -> anyhow::Result<()> {
-        std::fs::write(path, self.serialize()?.as_bytes())?;
-        Ok(())
-    }
-
-    pub fn addrs(&self) -> impl Iterator<Item = &Multiaddr> {
-        self.addrs.iter()
     }
 }
 
@@ -520,18 +515,3 @@ fn generate_ed25519_from_seed(seed_bytes: &[u8]) -> Keypair {
         .expect("this returns `Err` only if the length is wrong; the length is correct; qed");
     Keypair::Ed25519(secret_key.into())
 }
-//
-// fn addr_matches(addr: &Multiaddr, matcher: impl FnMut(multiaddr::Protocol) -> bool) -> bool {
-//     addr.iter().any(|addr| matcher(addr))
-// }
-// Track our observed addresses
-// self.listen_addrs.insert(info.observed_addr);
-
-// after the first connection, abort all other bootstrap connections.
-// for peer_id in &bootstrap_peer_ids {
-//     let _ = self.swarm.disconnect_peer_id(peer_id.clone());
-// }
-// println!(
-//     "Identify {peer_id} protocols {:?} addrs {:?}",
-//     info.protocols, info.listen_addrs
-// );
