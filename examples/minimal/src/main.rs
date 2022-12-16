@@ -131,7 +131,7 @@ impl Node {
         Ok(Self {
             swarm,
             verbose: false,
-        });
+        })
     }
 
     pub async fn drive_until_bistream(&mut self) -> bistream::BiStream {
