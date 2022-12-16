@@ -92,6 +92,16 @@ async fn main() -> anyhow::Result<()> {
             );
             let name = format!("{}", stream);
             spawn_bench_loop(stream, name);
+            tokio::spawn(async move {
+                let stream = node.open_bi(peer_id).await.unwrap();
+                eprintln!(
+                    "New stream opened to {} with id {}",
+                    stream.peer_id(),
+                    stream.stream_id()
+                );
+                let name = format!("{}", stream);
+                spawn_bench_loop(stream, name);
+            });
         }
     }
 
@@ -119,11 +129,13 @@ async fn event_loop(mut events: NodeEvents, node: NodeController) -> anyhow::Res
                 );
 
                 if endpoint.is_listener() && !incoming_peers.contains(&peer_id) {
-                    incoming_peers.insert(peer_id.clone());
+                    incoming_peers.insert(peer_id);
                     let node = node.clone();
                     tokio::spawn(async move {
+                        eprintln!("new connection incoming, open stream!");
                         match node.open_bi(peer_id).await {
                             Ok(stream) => {
+                                eprintln!("listener opened bi stream ok, {stream:?}");
                                 let name = format!("{}", stream);
                                 spawn_bench_loop(stream, name);
                             }
@@ -141,23 +153,6 @@ async fn event_loop(mut events: NodeEvents, node: NodeController) -> anyhow::Res
                     peer_id,
                     stream.stream_id()
                 );
-
-                if stream.is_accept() && !incoming_peers.contains(&peer_id) {
-                    incoming_peers.insert(peer_id.clone());
-                    let node = node.clone();
-                    let peer_id = peer_id.clone();
-                    tokio::spawn(async move {
-                        match node.open_bi(peer_id).await {
-                            Ok(stream) => {
-                                let name = format!("{}", stream);
-                                spawn_bench_loop(stream, name);
-                            }
-                            Err(err) => {
-                                eprintln!("failed to open stream on inbound from {peer_id}: {err}");
-                            }
-                        };
-                    });
-                }
 
                 let name = format!("{}", stream);
                 spawn_bench_loop(stream, name);

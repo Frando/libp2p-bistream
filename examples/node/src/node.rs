@@ -76,7 +76,7 @@ impl Config {
     }
 
     pub fn with_key_seed(self, seed: Option<String>) -> Self {
-        Self { seed, ..self }
+        Self { seed }
     }
 }
 
@@ -113,6 +113,73 @@ impl NodeController {
     }
 }
 
+#[derive(Default)]
+struct BistreamManager {
+    requests: HashMap<PeerId, HashMap<u64, BiStreamReply>>,
+}
+
+impl BistreamManager {
+    pub fn insert_request(&mut self, peer_id: PeerId, stream_id: u64, reply: BiStreamReply) {
+        let peer = self.requests.entry(peer_id).or_default();
+        peer.insert(stream_id, reply);
+    }
+
+    pub fn inject_stream(&mut self, stream: bistream::BiStream) {
+        if let Some(reply) = self.take_reply(&stream.peer_id(), &stream.stream_id()) {
+            let _ = reply.send(Ok(stream));
+        }
+    }
+    pub fn inject_failure(
+        &mut self,
+        peer_id: &PeerId,
+        stream_id: u64,
+        reason: bistream::OpenError,
+    ) {
+        if let Some(reply) = self.take_reply(peer_id, &stream_id) {
+            let _ = reply.send(Err(reason));
+        }
+    }
+
+    pub fn inject_event(&mut self, event: bistream::Event) -> Option<bistream::BiStream> {
+        match event {
+            bistream::Event::StreamReady(stream) => {
+                if stream.is_dial() {
+                    self.inject_stream(stream);
+                    None
+                } else {
+                    Some(stream)
+                }
+            }
+            bistream::Event::OpeningFailed {
+                peer_id,
+                stream_id,
+                reason,
+            } => {
+                self.inject_failure(&peer_id, stream_id, reason);
+                None
+            }
+        }
+    }
+
+    fn take_reply(&mut self, peer_id: &PeerId, stream_id: &u64) -> Option<BiStreamReply> {
+        let reply = self
+            .requests
+            .get_mut(peer_id)
+            .and_then(|peer| peer.remove(stream_id));
+
+        if reply.is_some()
+            && self
+                .requests
+                .get(peer_id)
+                .map(|peer| peer.is_empty())
+                .unwrap_or(false)
+        {
+            self.requests.remove(peer_id);
+        }
+        reply
+    }
+}
+
 pub struct Node {
     swarm: Swarm<NodeBehaviour>,
     event_tx: Sender<Event>,
@@ -122,6 +189,7 @@ pub struct Node {
     allowed_relays: HashSet<PeerId>,
     active_relays: HashMap<PeerId, HashSet<ListenerId>>,
     pending_peers: HashMap<PeerId, VecDeque<Command>>,
+    bistream_manager: BistreamManager,
 }
 
 pub type BiStreamReply = oneshot::Sender<Result<bistream::BiStream, bistream::OpenError>>;
@@ -183,6 +251,7 @@ impl Node {
             allowed_relays: HashSet::new(),
             active_relays: HashMap::new(),
             pending_peers: HashMap::new(),
+            bistream_manager: BistreamManager::default(),
         };
 
         // Set bootstrap addrs for DHT.
@@ -208,9 +277,8 @@ impl Node {
     }
 
     async fn emit_event(&mut self, event: Event) {
-        match self.event_tx.send(event).await {
-            Err(_) => warn!("Event channel is full or closed"),
-            Ok(_) => {}
+        if let Err(_) = self.event_tx.send(event).await {
+            warn!("Event channel is full or closed")
         }
     }
 
@@ -229,18 +297,17 @@ impl Node {
                     let swarm_event = swarm_event.expect("the swarm will never die");
                     if let Err(err) = self.handle_swarm_event(swarm_event).await {
                         error!("swarm error: {:?}", err);
-                        let _ = self.emit_event(Event::NodeError(err.into())).await;
+                        self.emit_event(Event::NodeError(err)).await;
                         break;
                     }
                 },
                 command = self.command_rx.recv() => {
-                    eprintln!("handle command {command:?}");
                     match command {
                         None => break,
                         Some(command) => {
                             if let Err(err) = self.handle_command(command).await {
                                 error!("command error: {:?}", err);
-                                let _ = self.emit_event(Event::NodeError(err.into())).await;
+                                self.emit_event(Event::NodeError(err)).await;
                                 break;
                             }
                         }
@@ -290,8 +357,9 @@ impl Node {
             }
 
             Command::OpenBi(peer_id, reply) => {
-                eprintln!("node oncommand open_bi {peer_id}");
-                self.swarm.behaviour_mut().bistream.open_bi(&peer_id, reply)
+                let stream_id = self.swarm.behaviour_mut().bistream.open_bi(&peer_id);
+                self.bistream_manager
+                    .insert_request(peer_id, stream_id, reply);
                 // if self.swarm.is_connected(&peer_id) {
                 //     self.swarm.behaviour_mut().bistream.open_bi(&peer_id, reply)
                 // } else {
@@ -380,11 +448,14 @@ impl Node {
             }
 
             // Emit new incoming streams.
-            SwarmEvent::Behaviour(Bistream(bistream::Event::IncomingStream(stream))) => self
-                .event_tx
-                .send(Event::IncomingBiStream(stream))
-                .await
-                .map_err(|_| anyhow!("Event receiver dropped"))?,
+            SwarmEvent::Behaviour(Bistream(event)) => {
+                if let Some(unhandled_stream) = self.bistream_manager.inject_event(event) {
+                    self.event_tx
+                        .send(Event::IncomingBiStream(unhandled_stream))
+                        .await
+                        .map_err(|_| anyhow!("Event receiver dropped"))?;
+                }
+            }
 
             // Use relay nodes.
             SwarmEvent::Behaviour(Identify(identify::Event::Received { peer_id, info })) => {
@@ -405,7 +476,7 @@ impl Node {
                         .iter()
                         .any(|x| x.as_bytes() == dcutr::PROTOCOL_NAME)
                 {
-                    self.listen_relay(peer_id, &info.listen_addrs)?;
+                    self.listen_relay(peer_id, &info.listen_addrs[..])?;
                 }
             }
             _ => {}
@@ -413,7 +484,7 @@ impl Node {
         Ok(())
     }
 
-    fn listen_relay(&mut self, peer_id: PeerId, addrs: &Vec<Multiaddr>) -> anyhow::Result<()> {
+    fn listen_relay(&mut self, peer_id: PeerId, addrs: &[Multiaddr]) -> anyhow::Result<()> {
         let listener_ids = addrs
             .iter()
             .filter(|addr| {
@@ -462,7 +533,7 @@ fn build_transport(
 
     // TCP
     let tcp_config = tcp::Config::default().port_reuse(port_reuse);
-    let tcp_transport = tcp::tokio::Transport::new(tcp_config.clone());
+    let tcp_transport = tcp::tokio::Transport::new(tcp_config);
 
     // Noise config for TCP
     let auth_config = {

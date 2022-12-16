@@ -21,21 +21,25 @@ use libp2p::{
         ConnectionHandler, ConnectionHandlerEvent, IntoConnectionHandler, KeepAlive,
         NetworkBehaviour, NetworkBehaviourAction, NotifyHandler, PollParameters, SubstreamProtocol,
     },
-    PeerId,
+    PeerId, Multiaddr,
 };
-use tokio::{sync::oneshot, time::Sleep};
-use tracing::{error, warn};
+use tokio::time::Sleep;
 
 use crate::stream::{BiStream, StreamOrigin};
 
-pub const PROTOCOL_NAME: &'static str = "/bistream/0.1.0";
+pub const PROTOCOL_NAME: &str = "/bistream/0.1.0";
 
 // TODO: Make configurable.
 pub const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug)]
 pub enum Event {
-    IncomingStream(BiStream),
+    StreamReady(BiStream),
+    OpeningFailed {
+        peer_id: PeerId,
+        stream_id: StreamId,
+        reason: OpenError,
+    },
 }
 
 #[derive(Debug)]
@@ -59,9 +63,6 @@ impl fmt::Display for OpenError {
 pub struct Behaviour {
     protocol_name: Option<String>,
     events: VecDeque<NetworkBehaviourAction<Event, HandlerPrototype>>,
-    pending_open: HashMap<PeerId, VecDeque<oneshot::Sender<Result<BiStream, OpenError>>>>,
-    pending_accept: HashMap<PeerId, VecDeque<oneshot::Sender<Result<BiStream, OpenError>>>>,
-    // peers: HashMap<PeerId, Peer>,
     peers_dialing: HashMap<PeerId, PeerDialing>,
     peers_connected: HashMap<PeerId, PeerConnected>,
 }
@@ -69,12 +70,14 @@ pub struct Behaviour {
 #[derive(Debug)]
 struct PeerDialing {
     timeout: Pin<Box<Sleep>>,
+    requested_outbound_streams: u64,
 }
 
 impl PeerDialing {
     fn new(timeout: Duration) -> Self {
         Self {
             timeout: Box::pin(tokio::time::sleep(timeout)),
+            requested_outbound_streams: 0,
         }
     }
 }
@@ -82,7 +85,16 @@ impl PeerDialing {
 #[derive(Debug)]
 struct PeerConnected {
     connection_id: ConnectionId,
-    streams: usize,
+    next_outbound_id: u64,
+}
+
+impl PeerConnected {
+    pub fn new(connection_id: ConnectionId) -> Self {
+        Self {
+            connection_id,
+            next_outbound_id: 1,
+        }
+    }
 }
 
 impl Behaviour {
@@ -97,49 +109,62 @@ impl Behaviour {
         }
     }
 
-    pub fn accept_bi_from_peer(
-        &mut self,
-        peer_id: &PeerId,
-        reply: oneshot::Sender<Result<BiStream, OpenError>>,
-    ) {
-        self.pending_accept
-            .entry(peer_id.clone())
-            .or_default()
-            .push_back(reply)
+    // pub fn accept_bi_from_peer(
+    //     &mut self,
+    //     peer_id: &PeerId,
+    //     reply: oneshot::Sender<Result<BiStream, OpenError>>,
+    // ) {
+    //     self.pending_accept
+    //         .entry(peer_id.clone())
+    //         .or_default()
+    //         .push_back(reply)
+    // }
+    
+    pub fn open_bi_with_addrs(&mut self, peer_id: &PeerId, addrs: Vec<Multiaddr>) -> u64 {
+        let dial_opts = DialOpts::peer_id(*peer_id)
+            .addresses(addrs)
+            .condition(PeerCondition::Always)
+            .build();
+        self.open_bi_with_dial_opts(dial_opts)
     }
 
-    pub fn open_bi(
-        &mut self,
-        peer_id: &PeerId,
-        reply: oneshot::Sender<Result<BiStream, OpenError>>,
-    ) {
-        self.pending_open
-            .entry(peer_id.clone())
-            .or_default()
-            .push_back(reply);
+    pub fn open_bi(&mut self, peer_id: &PeerId) -> u64 {
+        let dial_opts = DialOpts::peer_id(*peer_id)
+            .condition(PeerCondition::Always)
+            .build();
+        self.open_bi_with_dial_opts(dial_opts)
+    }
+
+    fn open_bi_with_dial_opts(&mut self, dial_opts: DialOpts) -> u64 {
+        let peer_id = dial_opts.get_peer_id().unwrap();
 
         // For connected peers: Open a new stream on the existing handler.
-        if let Some(peer) = self.peers_connected.get(peer_id) {
-            eprintln!("open bi HAS");
+        let stream_id = if let Some(peer) = self.peers_connected.get_mut(&peer_id) {
+            let stream_id = peer.next_outbound_id;
+            peer.next_outbound_id += 1;
             self.events
                 .push_back(NetworkBehaviourAction::NotifyHandler {
-                    peer_id: peer_id.clone(),
+                    peer_id,
                     handler: NotifyHandler::One(peer.connection_id),
-                    event: InEvent::OpenOutbound,
+                    event: InEvent::OpenOutbound(stream_id),
                 });
+            stream_id
         }
         // For unconnected peers: Try to dial the peer.
         else {
-            eprintln!("open bi HAS NOT");
-            self.peers_dialing
-                .insert(peer_id.clone(), PeerDialing::new(DIAL_TIMEOUT));
-            self.events.push_back(NetworkBehaviourAction::Dial {
-                opts: DialOpts::peer_id(peer_id.clone())
-                    .condition(PeerCondition::Always)
-                    .build(),
-                handler: HandlerPrototype::new(self.protocol_name.clone()),
-            });
-        }
+            // Start dialing the peer if not yet dialing.
+            if let std::collections::hash_map::Entry::Vacant(e) = self.peers_dialing.entry(peer_id) {
+                e.insert(PeerDialing::new(DIAL_TIMEOUT));
+                self.events.push_back(NetworkBehaviourAction::Dial {
+                    opts: dial_opts,
+                    handler: HandlerPrototype::new(self.protocol_name.clone()),
+                });
+            }
+            let peer = self.peers_dialing.get_mut(&peer_id).unwrap();
+            peer.requested_outbound_streams += 1;
+            peer.requested_outbound_streams
+        };
+        stream_id
     }
 }
 
@@ -153,40 +178,39 @@ impl NetworkBehaviour for Behaviour {
     fn on_swarm_event(&mut self, event: FromSwarm<Self::ConnectionHandler>) {
         match event {
             FromSwarm::ConnectionEstablished(conn) => {
-                eprintln!(
-                    "ESTABLISH peer_id {} other_established {} failed_addresses {:?}",
-                    conn.peer_id, conn.other_established, conn.failed_addresses
-                );
-
-                if let Some(_) = self.peers_dialing.remove(&conn.peer_id) {
-                    self.events
-                        .push_back(NetworkBehaviourAction::NotifyHandler {
-                            peer_id: conn.peer_id.clone(),
-                            handler: NotifyHandler::One(conn.connection_id),
-                            event: InEvent::OpenOutbound,
-                        });
-                }
-
-                self.peers_connected
+                let peer = self
+                    .peers_connected
                     .entry(conn.peer_id)
-                    .or_insert_with(|| PeerConnected {
-                        connection_id: conn.connection_id,
-                        streams: 0,
-                    });
+                    .or_insert_with(|| PeerConnected::new(conn.connection_id));
+
+                if let Some(dialing_peer) = self.peers_dialing.remove(&conn.peer_id) {
+                    for stream_id in 1..=dialing_peer.requested_outbound_streams {
+                        self.events
+                            .push_back(NetworkBehaviourAction::NotifyHandler {
+                                peer_id: conn.peer_id,
+                                handler: NotifyHandler::One(conn.connection_id),
+                                event: InEvent::OpenOutbound(stream_id),
+                            });
+                    }
+                    peer.next_outbound_id += dialing_peer.requested_outbound_streams + 1;
+                }
+            }
+            FromSwarm::ConnectionClosed(conn) => {
+                // TODO: Break streams and emit errors?
+                let mut remove = false;
+                if let Some(peer) = self.peers_connected.get(&conn.peer_id) {
+                    if peer.connection_id == conn.connection_id {
+                        remove = true;
+                    }
+                }
+                if remove {
+                    self.peers_connected.remove(&conn.peer_id);
+                }
             }
             FromSwarm::DialFailure(_failure) => {
                 // We don't care for failed dials here, as there can be many of them if only some
                 // of the dials to a peer fail and others succeed.
                 // In poll() we check the dial timeouts instead.
-
-                // eprintln!("FAILRURE {:?}", failure.peer_id);
-                // if let Some(peer_id) = failure.peer_id {
-                //     if let Some(replies) = self.pending_open.remove(&peer_id) {
-                //         for reply in replies.into_iter() {
-                //             let _ = reply.send(Err(OpenError::DialFailed(format!("{}", failure.error))));
-                //         }
-                //     }
-                // }
             }
             _ => {}
         }
@@ -198,51 +222,19 @@ impl NetworkBehaviour for Behaviour {
         _connection: ConnectionId,
         event: <<Self::ConnectionHandler as IntoConnectionHandler>::Handler as ConnectionHandler>::OutEvent,
     ) {
-        eprintln!("on_connection_event {:?}", event);
         match event {
             OutEvent::OutboundStream(stream) => {
-                eprintln!("open outbound! {stream:?}");
-                eprintln!("open outbound! connected {:?}", self.peers_connected);
-                eprintln!("open outbound! pending {:?}", self.pending_open);
-                if let Some(peer) = self.peers_connected.get_mut(&stream.peer_id()) {
-                    peer.streams += 1;
-                    match self
-                        .pending_open
-                        .get_mut(&stream.peer_id())
-                        .map(|x| x.pop_front())
-                        .flatten()
-                    {
-                        Some(reply) => {
-                            if let Err(_stream) = reply.send(Ok(stream)) {
-                                warn!("Reply channel for OpenBi dropped");
-                            }
-                        }
-                        _ => error!("Bad outbound stream - no reply channel registered"),
-                    }
-                }
+                self.events
+                    .push_back(NetworkBehaviourAction::GenerateEvent(Event::StreamReady(
+                        stream,
+                    )));
             }
             OutEvent::InboundStream(stream) => {
-                // if let Some(peer) = self.peers_connected.get_mut(&stream.peer_id()) {
-                //     peer.streams += 1;
-                match self
-                    .pending_accept
-                    .get_mut(&stream.peer_id())
-                    .map(|x| x.pop_front())
-                    .flatten()
-                {
-                    Some(reply) => {
-                        if let Err(_stream) = reply.send(Ok(stream)) {
-                            // TODO: when does this happen / what to do?
-                            warn!("Reply channel for OpenBi dropped");
-                        }
-                    }
-                    None => {
-                        self.events.push_back(NetworkBehaviourAction::GenerateEvent(
-                            Event::IncomingStream(stream),
-                        ));
-                    }
-                }
-            } // }
+                self.events
+                    .push_back(NetworkBehaviourAction::GenerateEvent(Event::StreamReady(
+                        stream,
+                    )));
+            }
         }
     }
 
@@ -260,17 +252,25 @@ impl NetworkBehaviour for Behaviour {
             .retain(|peer_id, peer| match peer.timeout.as_mut().poll(cx) {
                 Poll::Pending => true,
                 Poll::Ready(_) => {
-                    if let Some(replies) = self.pending_open.remove(&peer_id) {
-                        for reply in replies.into_iter() {
-                            let _ = reply
-                                .send(Err(OpenError::DialFailed("Dialing timeout reached".into())));
-                        }
+                    for stream_id in 1..=peer.requested_outbound_streams {
+                        self.events.push_back(NetworkBehaviourAction::GenerateEvent(
+                            Event::OpeningFailed {
+                                peer_id: *peer_id,
+                                stream_id,
+                                reason: OpenError::DialFailed("Dialing timeout reached".into()),
+                            },
+                        ));
                     }
                     false
                 }
             });
 
-        Poll::Pending
+        if let Some(event) = self.events.pop_front() {
+            Poll::Ready(event)
+        } else {
+            Poll::Pending
+        }
+
     }
 }
 
@@ -284,7 +284,7 @@ pub enum OutEvent {
 
 #[derive(Debug)]
 pub enum InEvent {
-    OpenOutbound,
+    OpenOutbound(u64),
 }
 
 #[derive(Debug)]
@@ -307,17 +307,14 @@ impl IntoConnectionHandler for HandlerPrototype {
         remote_peer_id: &PeerId,
         _connected_point: &libp2p::core::ConnectedPoint,
     ) -> Self::Handler {
-        eprintln!("proto to handler! for {remote_peer_id}");
         Handler {
             protocol_name: self.protocol_name,
-            peer_id: remote_peer_id.clone(),
+            peer_id: *remote_peer_id,
             events: VecDeque::new(),
-            inbound_stream_id: Arc::new(0.into()),
-            outbound_stream_id: 0,
+            next_inbound_stream_id: Arc::new(1.into()),
         }
     }
     fn inbound_protocol(&self) -> <Self::Handler as ConnectionHandler>::InboundProtocol {
-        eprintln!("inbound protocol!");
         ReadyUpgrade::new(self.protocol_name.clone())
     }
 }
@@ -327,8 +324,7 @@ pub struct Handler {
     protocol_name: String,
     events: VecDeque<ConnectionHandlerEvent<ProtocolTy, OpenInfo, OutEvent, io::Error>>,
     peer_id: PeerId,
-    inbound_stream_id: Arc<AtomicU64>,
-    outbound_stream_id: u64,
+    next_inbound_stream_id: Arc<AtomicU64>,
 }
 
 impl Handler {
@@ -338,9 +334,8 @@ impl Handler {
         origin: StreamOrigin,
         info: OpenInfo,
     ) {
-        let stream_id = info.stream_id;
         let stream = BiStream {
-            stream_id,
+            stream_id: info.stream_id,
             peer_id: self.peer_id,
             inner: proto,
             origin,
@@ -349,7 +344,6 @@ impl Handler {
             StreamOrigin::Outbound => OutEvent::OutboundStream(stream),
             StreamOrigin::Inbound => OutEvent::InboundStream(stream),
         };
-        eprintln!("EMIT {event:?}");
         self.events.push_back(ConnectionHandlerEvent::Custom(event));
     }
 }
@@ -359,12 +353,6 @@ type StreamId = u64;
 #[derive(Default, Debug)]
 pub struct OpenInfo {
     stream_id: StreamId,
-}
-
-impl Drop for Handler {
-    fn drop(&mut self) {
-        eprintln!("handler drop");
-    }
 }
 
 impl ConnectionHandler for Handler {
@@ -377,8 +365,7 @@ impl ConnectionHandler for Handler {
     type InboundOpenInfo = OpenInfo;
 
     fn listen_protocol(&self) -> SubstreamProtocol<ProtocolTy, OpenInfo> {
-        eprintln!("listen protocol!");
-        let stream_id = self.inbound_stream_id.fetch_add(1, Ordering::Relaxed);
+        let stream_id = self.next_inbound_stream_id.fetch_add(1, Ordering::Relaxed);
         SubstreamProtocol::new(
             ReadyUpgrade::new(self.protocol_name.clone()),
             OpenInfo { stream_id },
@@ -386,13 +373,8 @@ impl ConnectionHandler for Handler {
     }
 
     fn on_behaviour_event(&mut self, event: InEvent) {
-        eprintln!("on behaviour event {event:?}");
         match event {
-            InEvent::OpenOutbound => {
-                let stream_id = {
-                    self.outbound_stream_id += 1;
-                    self.outbound_stream_id
-                };
+            InEvent::OpenOutbound(stream_id) => {
                 let protocol = SubstreamProtocol::new(
                     ReadyUpgrade::new(self.protocol_name.clone()),
                     OpenInfo { stream_id },
@@ -426,7 +408,6 @@ impl ConnectionHandler for Handler {
             Self::OutboundOpenInfo,
         >,
     ) {
-        eprintln!("handler on_connection_event");
         match event {
             ConnectionEvent::FullyNegotiatedInbound(FullyNegotiatedInbound { protocol, info }) => {
                 self.emit_stream(protocol, StreamOrigin::Inbound, info);
