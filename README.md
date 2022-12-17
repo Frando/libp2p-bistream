@@ -1,11 +1,12 @@
 # libp2p-bistream
 
+*Maintenance status: Experimental, work in progress*
+
 A very simple protocol for [libp2p](https://github.com/libp2p/rust-libp2p) that exposes binary duplex streams.
 
 It works with the usual libp2p stack of transports and muxers, and allows application-level code to work directly on any number of bidirectional streams between peers.
 
 See the [example](examples/minimal/src/main.rs) for a usage example.
-
 
 ## License
 
