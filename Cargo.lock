@@ -1008,20 +1008,11 @@ name = "example-minimal"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-channel",
- "async-trait",
- "base32",
- "bincode",
  "clap",
  "futures",
  "libp2p",
  "libp2p-bistream",
- "lz4_flex",
- "multibase",
- "multihash 0.17.0",
- "pretty-bytes",
  "serde",
- "thiserror",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1615,8 +1606,6 @@ dependencies = [
 name = "libp2p-bistream"
 version = "0.1.0"
 dependencies = [
- "async-channel",
- "async-trait",
  "futures",
  "libp2p",
  "serde",
