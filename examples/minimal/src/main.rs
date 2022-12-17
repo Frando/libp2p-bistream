@@ -135,17 +135,16 @@ impl Node {
     }
 
     pub async fn drive_until_bistream(&mut self) -> bistream::BiStream {
-        use NodeBehaviourEvent::*;
         loop {
             let event = self.swarm.next().await.expect("the swarm never dies");
             if self.verbose {
                 println!("event: {:?}", event);
             }
-            match event {
-                SwarmEvent::Behaviour(Bistream(bistream::Event::StreamReady(stream))) => {
-                    return stream;
-                }
-                _ => {}
+            if let SwarmEvent::Behaviour(NodeBehaviourEvent::Bistream(
+                bistream::Event::StreamReady(stream),
+            )) = event
+            {
+                return stream;
             }
         }
     }
@@ -173,13 +172,9 @@ fn build_transport(keypair: &Keypair) -> Boxed<(PeerId, StreamMuxerBox)> {
     // Stream muxer config for TCP
     let muxer_config = {
         let mut yamux_config = yamux::YamuxConfig::default();
-        yamux_config.set_max_buffer_size(16 * 1024 * 1024); // TODO: configurable
-        yamux_config.set_receive_window_size(16 * 1024 * 1024); // TODO: configurable
         yamux_config.set_window_update_mode(yamux::WindowUpdateMode::on_read());
         yamux_config
     };
-
-    
 
     tcp_transport
         .upgrade(core::upgrade::Version::V1Lazy)
