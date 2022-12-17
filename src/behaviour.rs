@@ -109,15 +109,13 @@ impl Behaviour {
         }
     }
 
-    // pub fn accept_bi_from_peer(
+    // TODO: Maybe add a mode where only explictly-requested streams are accepted?
+    // pub fn accept_bi(
     //     &mut self,
     //     peer_id: &PeerId,
     //     reply: oneshot::Sender<Result<BiStream, OpenError>>,
     // ) {
-    //     self.pending_accept
-    //         .entry(peer_id.clone())
-    //         .or_default()
-    //         .push_back(reply)
+    //   unimplemented!()
     // }
     
     pub fn open_bi_with_addrs(&mut self, peer_id: &PeerId, addrs: Vec<Multiaddr>) -> u64 {
