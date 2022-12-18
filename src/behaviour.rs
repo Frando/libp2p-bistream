@@ -27,8 +27,6 @@ use tokio::time::Sleep;
 
 use crate::stream::{BiStream, StreamOrigin};
 
-pub const PROTOCOL_NAME: &str = "/bistream/0.1.0";
-
 // TODO: Make configurable.
 pub const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -61,7 +59,7 @@ impl fmt::Display for OpenError {
 
 #[derive(Default, Debug)]
 pub struct Behaviour {
-    protocol_name: Option<String>,
+    protocol_name: String,
     events: VecDeque<NetworkBehaviourAction<Event, HandlerPrototype>>,
     peers_dialing: HashMap<PeerId, PeerDialing>,
     peers_connected: HashMap<PeerId, PeerConnected>,
@@ -98,13 +96,9 @@ impl PeerConnected {
 }
 
 impl Behaviour {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn with_protocol_name(name: String) -> Self {
+    pub fn new(protocol_name: String) -> Self {
         Self {
-            protocol_name: Some(name),
+            protocol_name,
             ..Default::default()
         }
     }
@@ -291,9 +285,9 @@ pub struct HandlerPrototype {
 }
 
 impl HandlerPrototype {
-    pub fn new(protocol_name: Option<String>) -> Self {
+    pub fn new(protocol_name: String) -> Self {
         HandlerPrototype {
-            protocol_name: protocol_name.unwrap_or_else(|| PROTOCOL_NAME.into()),
+            protocol_name
         }
     }
 }
