@@ -1,0 +1,31 @@
+[package]
+name = "example-managed"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0.66"
+futures = "0.3.25"
+serde = "1.0.149"
+tokio = { version = "1.22.0", features = ["macros", "rt-multi-thread"] }
+tracing = "0.1.37"
+tracing-subscriber = "0.3.16"
+clap = { version = "4.0.29", features = ["derive"] }
+libp2p-bistream = { path = "../.." }
+
+[dependencies.libp2p]
+version = "0.50"
+default-features = false
+features = [
+  "identify",
+  "ping",
+  "noise",
+  "yamux",
+  "tcp",
+  "serde",
+  "tokio",
+  "macros",
+] 

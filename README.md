@@ -2,11 +2,13 @@
 
 *Maintenance status: Experimental, work in progress*
 
-A very simple protocol for [libp2p](https://github.com/libp2p/rust-libp2p) that exposes binary duplex streams.
+A very simple network behavior for [libp2p](https://github.com/libp2p/rust-libp2p) that exposes binary duplex streams.
 
 It works with the usual libp2p stack of transports and muxers, and allows application-level code to work directly on any number of bidirectional streams between peers.
 
 See the [example](examples/minimal/src/main.rs) for a usage example.
+
+Optionally, a *managed* mode is available, where the streams opened and accepted through this behavior may be managed outside of the main libp2p event loop. See [examples/managed](examples/managed/src/main.rs) for an example.
 
 ## License
 
