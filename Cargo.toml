@@ -11,6 +11,8 @@ serde = "1.0.149"
 tokio = { version = "1.22.0", features = ["sync", "time"] }
 tracing = "0.1.37"
 libp2p = { version = "0.50", default-features = false }
+thiserror = "1.0.38"
+smallvec = "1.10.0"
 
 [workspace]
-members = ["examples/node", "examples/minimal"]
+members = ["examples/node", "examples/minimal", "examples/managed"]

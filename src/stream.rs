@@ -40,16 +40,16 @@ pub struct BiStream {
 impl fmt::Display for BiStream {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let d = match self.origin {
-            StreamOrigin::Inbound => "A",
-            StreamOrigin::Outbound => "D",
+            StreamOrigin::Inbound => "accept",
+            StreamOrigin::Outbound => "dial",
         };
         let peer_id = self.peer_id.to_base58();
         write!(
             f,
-            "{}…{}:{}{}",
+            "{}:{}…{}:{}",
+            d,
             &peer_id[..2],
             &peer_id[peer_id.len() - 3..],
-            d,
             self.stream_id
         )
     }

@@ -21,11 +21,15 @@ use libp2p::{
         ConnectionHandler, ConnectionHandlerEvent, IntoConnectionHandler, KeepAlive,
         NetworkBehaviour, NetworkBehaviourAction, NotifyHandler, PollParameters, SubstreamProtocol,
     },
-    PeerId, Multiaddr,
+    Multiaddr, PeerId,
 };
 use tokio::time::Sleep;
+use tracing::debug;
 
-use crate::stream::{BiStream, StreamOrigin};
+use crate::{
+    stream::{BiStream, StreamOrigin},
+    Endpoint, Manager, ManagerEvent,
+};
 
 // TODO: Make configurable.
 pub const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -63,6 +67,7 @@ pub struct Behaviour {
     events: VecDeque<NetworkBehaviourAction<Event, HandlerPrototype>>,
     peers_dialing: HashMap<PeerId, PeerDialing>,
     peers_connected: HashMap<PeerId, PeerConnected>,
+    manager: Option<Manager>,
 }
 
 #[derive(Debug)]
@@ -96,6 +101,9 @@ impl PeerConnected {
 }
 
 impl Behaviour {
+    /// Create a new bistream behavior.
+    ///
+    /// The protocol name is required and has to be the same on all peers.
     pub fn new(protocol_name: String) -> Self {
         Self {
             protocol_name,
@@ -103,15 +111,21 @@ impl Behaviour {
         }
     }
 
-    // TODO: Maybe add a mode where only explictly-requested streams are accepted?
-    // pub fn accept_bi(
-    //     &mut self,
-    //     peer_id: &PeerId,
-    //     reply: oneshot::Sender<Result<BiStream, OpenError>>,
-    // ) {
-    //   unimplemented!()
-    // }
-    
+    /// Enable managed mode.
+    ///
+    /// This returns an [Endpoint] struct which can be used to open and accept streams
+    /// outside of the libp2p event loop.
+    ///
+    /// When in managed mode, this network behavior will not emit any events to the main
+    /// libp2p network behavior event loop. Instead, the connections will be handled by the
+    /// manager through channels and can be accessed via the [Endpoint] and [Connection]
+    /// structs.
+    pub fn managed(&mut self) -> Endpoint {
+        let (manager, endpoint) = Manager::new();
+        self.manager = Some(manager);
+        endpoint
+    }
+
     pub fn open_bi_with_addrs(&mut self, peer_id: &PeerId, addrs: Vec<Multiaddr>) -> u64 {
         let dial_opts = DialOpts::peer_id(*peer_id)
             .addresses(addrs)
@@ -145,7 +159,8 @@ impl Behaviour {
         // For unconnected peers: Try to dial the peer.
         else {
             // Start dialing the peer if not yet dialing.
-            if let std::collections::hash_map::Entry::Vacant(e) = self.peers_dialing.entry(peer_id) {
+            if let std::collections::hash_map::Entry::Vacant(e) = self.peers_dialing.entry(peer_id)
+            {
                 e.insert(PeerDialing::new(DIAL_TIMEOUT));
                 self.events.push_back(NetworkBehaviourAction::Dial {
                     opts: dial_opts,
@@ -197,6 +212,9 @@ impl NetworkBehaviour for Behaviour {
                 }
                 if remove {
                     self.peers_connected.remove(&conn.peer_id);
+                    if let Some(manager) = self.manager.as_mut() {
+                        manager.handle_disconnect(&conn.peer_id);
+                    }
                 }
             }
             FromSwarm::DialFailure(_failure) => {
@@ -214,19 +232,20 @@ impl NetworkBehaviour for Behaviour {
         _connection: ConnectionId,
         event: <<Self::ConnectionHandler as IntoConnectionHandler>::Handler as ConnectionHandler>::OutEvent,
     ) {
-        match event {
-            OutEvent::OutboundStream(stream) => {
-                self.events
-                    .push_back(NetworkBehaviourAction::GenerateEvent(Event::StreamReady(
-                        stream,
-                    )));
-            }
-            OutEvent::InboundStream(stream) => {
-                self.events
-                    .push_back(NetworkBehaviourAction::GenerateEvent(Event::StreamReady(
-                        stream,
-                    )));
-            }
+        let stream = match event {
+            OutEvent::OutboundStream(stream) => stream,
+            OutEvent::InboundStream(stream) => stream,
+        };
+        debug!("New BiStream: {stream}");
+        // Pass the stream to the manager if in managed mode.
+        if let Some(manager) = self.manager.as_mut() {
+            manager.handle_stream(stream);
+        // Otherwise emit the stream as an event.
+        } else {
+            self.events
+                .push_back(NetworkBehaviourAction::GenerateEvent(Event::StreamReady(
+                    stream,
+                )));
         }
     }
 
@@ -235,6 +254,20 @@ impl NetworkBehaviour for Behaviour {
         cx: &mut Context<'_>,
         _params: &mut impl PollParameters,
     ) -> Poll<NetworkBehaviourAction<Event, HandlerPrototype>> {
+        // Poll the manager if in managed mode.
+        while let Some(Poll::Ready(event)) = self
+            .manager
+            .as_mut()
+            .and_then(|manager| Some(manager.poll(cx)))
+        {
+            let dial_opts = match event {
+                ManagerEvent::Open(peer_id) => DialOpts::peer_id(peer_id).build(),
+                ManagerEvent::Dial(dial_opts) => dial_opts,
+            };
+            self.open_bi_with_dial_opts(dial_opts);
+        }
+
+        // Emit all events from the queue.
         if let Some(event) = self.events.pop_front() {
             return Poll::Ready(event);
         }
@@ -262,7 +295,6 @@ impl NetworkBehaviour for Behaviour {
         } else {
             Poll::Pending
         }
-
     }
 }
 
@@ -286,9 +318,7 @@ pub struct HandlerPrototype {
 
 impl HandlerPrototype {
     pub fn new(protocol_name: String) -> Self {
-        HandlerPrototype {
-            protocol_name
-        }
+        HandlerPrototype { protocol_name }
     }
 }
 
