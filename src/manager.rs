@@ -26,6 +26,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum Error {
     #[error("Channel closed")]
     ChannelClosed,
+    #[error("Failed to dial peer")]
+    DialFailed,
 }
 
 pub struct DialRequest {
@@ -145,21 +147,34 @@ impl Manager {
         (manager, endpoint)
     }
 
-    fn create_conn(&mut self, stream: BiStream) -> Connection {
-        let peer_id = stream.peer_id();
+    fn create_conn(&mut self, peer_id: PeerId, stream: Option<BiStream>) -> Connection {
         let (accept_tx, accept_rx) = mpsc::unbounded_channel();
         let conn = Connection {
             open_tx: self.open_tx.clone(),
             accept_rx: Arc::new(Mutex::new(accept_rx)),
             peer_id: peer_id.clone(),
         };
+        if let Some(stream) = stream {
+            let _ = accept_tx.send(stream);
+        }
         self.conn_stream_inbound.insert(peer_id, accept_tx);
         conn
+    }
+
+    pub fn handle_connection_incoming(&mut self, peer_id: PeerId) {
+        let conn = self.create_conn(peer_id, None);
+        let _ = self.conn_tx.send(conn);
     }
 
     pub fn handle_disconnect(&mut self, peer_id: &PeerId) {
         self.conn_stream_inbound.remove(&peer_id);
         self.conn_stream_outbound.remove(&peer_id);
+    }
+
+    pub fn handle_dial_failed(&mut self, peer_id: &PeerId) {
+        if let Some(reply) = self.conn_dial.remove(peer_id) {
+            let _ = reply.send(Err(Error::DialFailed));
+        }
     }
 
     pub fn handle_stream(&mut self, stream: BiStream) {
@@ -170,8 +185,8 @@ impl Manager {
                     let _ = sender.send(stream);
                 }
                 None => {
-                    let conn = self.create_conn(stream);
-                    let _ = self.conn_tx.send(conn);
+                    let conn = self.create_conn(stream.peer_id(), Some(stream));
+                    let _ = self.conn_tx.send(conn.clone());
                 }
             },
             StreamOrigin::Outbound => {
@@ -183,7 +198,7 @@ impl Manager {
                     let _ = req.send(Ok(stream));
                 } else {
                     if let Some(sender) = self.conn_dial.remove(&peer_id) {
-                        let conn = self.create_conn(stream);
+                        let conn = self.create_conn(stream.peer_id, Some(stream));
                         let _ = sender.send(Ok(conn));
                     } else {
                         warn!("Stream opened without being requested");
