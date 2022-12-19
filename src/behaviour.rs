@@ -277,14 +277,18 @@ impl NetworkBehaviour for Behaviour {
             .retain(|peer_id, peer| match peer.timeout.as_mut().poll(cx) {
                 Poll::Pending => true,
                 Poll::Ready(_) => {
-                    for stream_id in 1..=peer.requested_outbound_streams {
-                        self.events.push_back(NetworkBehaviourAction::GenerateEvent(
-                            Event::OpeningFailed {
-                                peer_id: *peer_id,
-                                stream_id,
-                                reason: OpenError::DialFailed("Dialing timeout reached".into()),
-                            },
-                        ));
+                    if let Some(manager) = self.manager.as_mut() {
+                        manager.handle_dial_failed(peer_id);
+                    } else {
+                        for stream_id in 1..=peer.requested_outbound_streams {
+                            self.events.push_back(NetworkBehaviourAction::GenerateEvent(
+                                Event::OpeningFailed {
+                                    peer_id: *peer_id,
+                                    stream_id,
+                                    reason: OpenError::DialFailed("Dialing timeout reached".into()),
+                                },
+                            ));
+                        }
                     }
                     false
                 }
