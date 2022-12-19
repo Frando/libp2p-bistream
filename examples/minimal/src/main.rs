@@ -14,7 +14,7 @@ use libp2p::{
 
 use libp2p_bistream as bistream;
 
-pub const PROTOCOL_NAME: &str = "bistream/example-minimal/0.1.0";
+pub const PROTOCOL_NAME: &str = "/bistream/example-minimal/0.1.0";
 
 #[derive(Parser)]
 pub struct Args {
